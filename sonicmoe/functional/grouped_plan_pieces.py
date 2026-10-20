@@ -247,7 +247,8 @@ def _merge_rows(
 class PlanPieces:
     """`local_select` / `merge` for one (tokens per piece, K, pieces) and a
     `GPUIndex`.  `merge` keeps its output buffers per ``slot``: a caller that
-    holds several merged plans alive at once passes a distinct slot per plan."""
+    holds several merged plans alive at once passes a distinct slot per plan,
+    or ``slot=None`` for a freshly allocated plan it owns."""
 
     def __init__(self, gidx, tokens_per_piece, K, pieces, BT=64):
         TL, P = int(tokens_per_piece), int(pieces)
@@ -270,20 +271,31 @@ class PlanPieces:
         gidx._lane_pairs(K)
         self._slots = {}
 
+    def _new_plan(self):
+        g, T = self.g, self.TL * self.P
+        TK = T * self.K
+        i32 = lambda n: paddle.empty([n], dtype=paddle.int32)  # noqa: E731
+        return Plan(
+            cu=i32(g.cu_len),
+            row_tok=paddle.empty([TK], dtype=paddle.int16),
+            row_code=paddle.empty([TK], dtype=paddle.int16),
+            perm=i32(TK),
+            moff=i32(T + 1),
+        )
+
     def _slot(self, slot):
         b = self._slots.get(slot)
         if b is None:
-            g, T = self.g, self.TL * self.P
-            TK = T * self.K
+            g = self.g
             i32 = lambda n: paddle.empty([n], dtype=paddle.int32)  # noqa: E731
-            plan = Plan(
-                cu=i32(g.cu_len),
-                row_tok=paddle.empty([TK], dtype=paddle.int16),
-                row_code=paddle.empty([TK], dtype=paddle.int16),
-                perm=i32(TK),
-                moff=i32(T + 1),
+            b = self._slots[slot] = (
+                i32(g.S + 1),
+                i32(self.P * g.S),
+                i32(self.P),
+                None if slot is None else self._new_plan(),
             )
-            b = self._slots[slot] = (i32(g.S + 1), i32(self.P * g.S), i32(self.P), plan)
+        if slot is None:  # a fresh plan; the merge's own work buffers are reused
+            b = b[:3] + (self._new_plan(),)
         return b
 
     def local_select(self, ids):

@@ -83,6 +83,22 @@ def test_pieces_plan_matches_gpu_plan(case, x_first):
         assert np.array_equal(o, o_ref), np.abs(o - o_ref).max()
 
 
+def test_fresh_plan_slot():
+    """slot=None returns a new plan each call; earlier ones stay intact."""
+    E, K, T, NP = 64, 8, 1024, 4
+    _, ids = _routing(E, K, T, 0.1, seed=4)
+    gidx = GPUIndex(P.build_index(frequent_pairs(ids, 100), E))
+    pp = PlanPieces(gidx, T // NP, K, NP)
+    ids_d = dev(ids, paddle.int32)
+    src = _pieces_src(pp, ids_d, paddle.ones([T, K], dtype=paddle.float32), False)
+    a = pp.merge(src, slot=None)
+    a_moff = a.moff.numpy().copy()
+    b = pp.merge(src, slot=None)
+    paddle.device.synchronize()
+    assert a.moff.data_ptr() != b.moff.data_ptr() and a.row_tok.data_ptr() != b.row_tok.data_ptr()
+    assert np.array_equal(a.moff.numpy(), a_moff) and np.array_equal(b.moff.numpy(), a_moff)
+
+
 def test_pieces_repeat_and_shape_checks():
     """Counters are re-zeroed between calls; bad shapes are rejected."""
     E, K, T, NP = 64, 8, 1024, 4
