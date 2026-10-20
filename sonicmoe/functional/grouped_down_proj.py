@@ -36,6 +36,7 @@ from quack.gemm_interface import gemm
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 _BR = 32  # rows per pack program
+_BR_DIRECT = 128  # rows per direct-pack program (gather latency bound: more rows in flight)
 _CHECK_DIRECT = True  # direct pack: verify every lane's expert against the plan
 _BT = 32  # tokens per lane-table program
 # ``paddle.device.cuda.current_stream`` carries a @deprecated wrapper that
@@ -330,9 +331,9 @@ def grouped_down_proj(
     for c, nseg, at, bidx, nmax, a, y2v in buckets:  # rows of a GEMM are < nmax
         cu = plan.cu_slice(at, nseg)
         if lanes_sorted:
-            _pack_direct_kernel[(triton.cdiv(nmax, _BR),)](
+            _pack_direct_kernel[(triton.cdiv(nmax, _BR_DIRECT),)](
                 y1, plan.row_tok, plan.row_code, lane_rows, lane_scores, off, expert_frequency_offset,
-                bidx if bidx is not None else cu, cu, a, err, nseg, K=K, I=I, C=c, BR=_BR,
+                bidx if bidx is not None else cu, cu, a, err, nseg, K=K, I=I, C=c, BR=_BR_DIRECT,
                 IP=triton.next_power_of_2(I), VARLEN=varlen, CHECK=_CHECK_DIRECT,
                 LOGS=max(1, int(nseg).bit_length()), num_warps=4,
             )
