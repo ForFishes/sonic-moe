@@ -2165,6 +2165,7 @@ class _UpProjection(torch.autograd.Function):
                         _gp.plan,
                         _gp.groups,
                         _gp.err,
+                        lanes_sorted=_gp.lanes_sorted,
                     )
                 # _log_stage_memory("In backward, after w1 grad")
         else:
@@ -2374,6 +2375,7 @@ class _DownProjection(torch.autograd.Function):
                         cur.groups,
                         cur.err,
                         ready_event=cur.ready_event,
+                        lanes_sorted=cur.lanes_sorted,
                     )
                     if tuple(o_grouped.shape) != (T, H) or o_grouped.dtype != torch.bfloat16:
                         raise ValueError(

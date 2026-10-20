@@ -170,6 +170,13 @@ def _cached_arange(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     return t[:n]
 
 
+def metadata_lanes_expert_sorted() -> bool:
+    """Whether `deepep_topk_to_sonic_metadata` lists each token's lanes in
+    ascending expert order (the CUDA kernel does; the Python fallback keeps the
+    top-k slot order)."""
+    return _HAS_TOPK_CUDA_KERNEL
+
+
 def deepep_topk_to_sonic_metadata(
     dispatched_indices: torch.Tensor,   # [N_recv, topk] int32, -1 = masked
     dispatched_probs: torch.Tensor,     # [N_recv, topk] float32

@@ -260,3 +260,43 @@ def test_group_lists_share_buffers_and_stay_correct():
             assert err == 0
             assert np.array_equal(o_g, o_prod)
     assert len(gdp._scratch) <= n_before + 1  # one buffer set for the shape, not one per list
+
+
+@pytest.mark.parametrize("drop", [0.0, 0.1])
+def test_direct_lanes_from_cuda_metadata(drop):
+    """With lanes from sonic's routing-metadata kernel (each token's lanes in
+    ascending expert order), lanes_sorted=True skips the lane tables and gives
+    the same output bit for bit; a plan from other routing sets the error."""
+    import importlib
+
+    md = importlib.import_module("sonicmoe.ernie_compat.deepep_metadata")
+    if not md.metadata_lanes_expert_sorted():
+        pytest.skip("CUDA routing-metadata kernel not built")
+    E, K, T, H, I = 64, 8, 2048, 256, 48
+    rng = np.random.RandomState(13)
+    ids = _routing(rng, E, K, T, drop).astype(np.int32)
+    tpe = np.bincount(ids[ids >= 0], minlength=E).astype(np.int32)
+    p = rng.rand(T, K).astype(np.float32)
+    efo, _, _, rows, off, sc = md.deepep_topk_to_sonic_metadata(
+        dev(ids, paddle.int32), dev(p, paddle.float32), dev(tpe, paddle.int32), E, block=1
+    )[:6]
+    index = P.build_index(frequent_groups(ids, (2, 3), 200), E)
+    out = P.alloc_out(T, K, index)
+    nrow = P.plan(ids.astype(np.int16), index, P.Scratch(T, K, index, 8), out)
+    plan, gl = Plan.from_host(out, nrow), GroupList(index)
+    y1 = dev(rng.randint(-2, 3, (int(rows.shape[0]), I)).astype(np.float32), paddle.float32).astype(paddle.bfloat16)
+    w2 = dev(rng.randint(-1, 2, (E, H, I)).astype(np.float32), paddle.float32).astype(paddle.bfloat16)
+    d_ids = dev(ids, paddle.int32)
+
+    def run(sorted_, plan_=plan):
+        err = paddle.zeros([1], dtype=paddle.int32)
+        o = grouped_down_proj(y1, w2, efo, rows, sc, off, d_ids, plan_, gl, err, lanes_sorted=sorted_)
+        paddle.device.synchronize()
+        return o.astype(paddle.float32).numpy(), int(err.numpy()[0])
+
+    (a, ea), (b, eb) = run(False), run(True)
+    assert ea == 0 and eb == 0 and np.array_equal(a, b)
+    other = ids[rng.permutation(T)]
+    out2 = P.alloc_out(T, K, index)
+    n2 = P.plan(other.astype(np.int16), index, P.Scratch(T, K, index, 8), out2)
+    assert run(True, Plan.from_host(out2, n2))[1] == 1
