@@ -36,6 +36,8 @@ from quack.gemm_interface import gemm
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 _BR = 32  # rows per pack program
+_BR_DIRECT = 128  # rows per direct-pack program (gather latency bound: more rows in flight)
+_CHECK_DIRECT = True  # direct pack: verify every lane's expert against the plan
 _BT = 32  # tokens per lane-table program
 # ``paddle.device.cuda.current_stream`` carries a @deprecated wrapper that
 # costs ~7 us per call, 25x the function itself; the new-API namespace is not
@@ -120,6 +122,60 @@ def _pack_kernel(
         tl.store(dst_ptr + (r[:, None].to(tl.int64) * C + j) * I + c[None, :], v.to(tl.bfloat16), mask=mc)
 
 
+@triton.jit
+def _pack_direct_kernel(
+    y1_ptr, tok_ptr, code_ptr, rows_ptr, scores_ptr, off_ptr, efo_ptr, bidx_ptr, cu_ptr, dst_ptr, err_ptr, nseg,
+    K: tl.constexpr, I: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, IP: tl.constexpr,
+    VARLEN: tl.constexpr, CHECK: tl.constexpr, LOGS: tl.constexpr,
+):
+    """`_pack_kernel` for lane metadata whose lanes of a token are in ascending
+    expert order (sorted rank j = the token's j-th lane): reads the lane rows /
+    scores directly, no lane tables.  CHECK: every lane's row must lie in the
+    segment of the expert the plan assigns to it (else *err_ptr is set)."""
+    lo = tl.load(cu_ptr)
+    hi = tl.load(cu_ptr + nseg)
+    r = lo + tl.program_id(0) * BR + tl.arange(0, BR)
+    m = r < hi
+    t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
+    code = tl.load(code_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
+    if VARLEN:
+        base = tl.load(off_ptr + t, mask=m, other=0)
+    else:
+        base = t * K
+    if CHECK:  # segment of each row: largest g with cu[g] <= r
+        g_lo = tl.zeros([BR], dtype=tl.int32)
+        g_hi = tl.full([BR], 0, dtype=tl.int32) + nseg
+        for _ in tl.static_range(LOGS):
+            act = g_lo + 1 < g_hi
+            mid = (g_lo + g_hi) // 2
+            v = tl.load(cu_ptr + mid, mask=m & act, other=0)
+            go = act & (v <= r)
+            g_lo = tl.where(go, mid, g_lo)
+            g_hi = tl.where(act & ~go, mid, g_hi)
+    c = tl.arange(0, IP)
+    if IP == I:
+        mc = m[:, None]
+    else:
+        mc = m[:, None] & (c[None, :] < I)
+    for j in tl.static_range(C):
+        lane = base + ((code >> (4 * j)) & 15)
+        src = tl.load(rows_ptr + lane, mask=m, other=0)
+        sc = tl.load(scores_ptr + lane, mask=m, other=0.0).to(tl.float32)
+        if CHECK:
+            if C > 1:
+                e = tl.load(bidx_ptr + g_lo * C + j, mask=m, other=0)
+            else:
+                e = g_lo
+            e0 = tl.load(efo_ptr + e, mask=m, other=0)
+            e1 = tl.load(efo_ptr + e + 1, mask=m, other=0)
+            bad = tl.sum(tl.where(m & ((src < e0) | (src >= e1)), 1, 0))
+            if bad > 0:
+                tl.store(err_ptr, 1)
+        v = tl.load(y1_ptr + src.to(tl.int64)[:, None] * I + c[None, :], mask=mc, other=0.0)
+        v = v.to(tl.float32) * sc[:, None]
+        tl.store(dst_ptr + (r[:, None].to(tl.int64) * C + j) * I + c[None, :], v.to(tl.bfloat16), mask=mc)
+
+
 def supports_expert_k(I):
     """Whether `grouped_down_proj` runs with a per-expert K (intermediate size
     per expert) of ``I``.  The segmented-B GEMM needs every segment to be whole
@@ -198,31 +254,42 @@ class Plan:
 
 
 class _Scratch:
-    """``grouped_down_proj``'s work buffers for one (T, K, E, H, I) and group
-    list: the lane tables, the A buffer every bucket packs into in turn, y2,
-    and the per-bucket A / y2 views.  ``o`` is not here: it is the call's
-    result and stays a fresh tensor."""
+    """``grouped_down_proj``'s work buffers for one (T, K, H, I): the lane
+    tables, the A buffer every bucket packs into in turn, and y2.  Shared by
+    every group list (every layer) of the process: a call consumes them before
+    it returns, and calls on one stream run in order.  ``o`` is not here: it
+    is the call's result and stays a fresh tensor."""
 
-    def __init__(self, T, K, I, H, groups):
+    def __init__(self, T, K, I, H):
         TK = T * K
         self.row_s = paddle.empty([TK], dtype=paddle.int32)
         self.w_s = paddle.empty([TK], dtype=paddle.float32)
-        a_buf = paddle.empty([TK * I], dtype=paddle.bfloat16)
+        self.a_buf = paddle.empty([TK * I], dtype=paddle.bfloat16)
         self.y2 = paddle.empty([TK, H], dtype=paddle.bfloat16)
         self.KP = triton.next_power_of_2(K)
-        self.buckets = tuple(
-            (c, nseg, at, bidx, TK // c, a_buf[: (TK // c) * c * I].view([TK // c, c * I]),
-             self.y2[: TK // c])
+
+
+_scratch = {}  # (T, K, H, I) -> _Scratch, one per shape for the whole process
+
+
+def _buckets(groups, s, T, K, I, H):
+    """Per-bucket A / y2 views of the shared buffers for one group list; kept
+    on the group list, so they live and die with it."""
+    views = groups.__dict__.setdefault("_views", {})
+    key = (T, K, I, H)
+    b = views.get(key)
+    if b is None:
+        TK = T * K
+        b = views[key] = tuple(
+            (c, nseg, at, bidx, TK // c, s.a_buf[: (TK // c) * c * I].view([TK // c, c * I]), s.y2[: TK // c])
             for c, nseg, at, bidx in groups.gemms
         )
-
-
-_scratch = {}  # (id(groups), T, K, E, H, I) -> _Scratch
+    return b
 
 
 def grouped_down_proj(
     y1, w2, expert_frequency_offset, lane_rows, lane_scores, token_lane_offset, ids, plan, groups,
-    err=None, config=None, ready_event=None,
+    err=None, config=None, ready_event=None, lanes_sorted=False,
 ):
     """Grouped GEMM2 + combine of one batch; returns o [T, H] bf16.
 
@@ -230,9 +297,14 @@ def grouped_down_proj(
     current stream waits on it first, so the plan can be built concurrently
     with the work before this call.
 
-    The work buffers are kept per (group list, shape) and reused across calls;
-    only ``o`` is freshly allocated.  Two concurrent calls of the same shape on
-    the same group list would therefore share them, which the ring never does.
+    ``lanes_sorted``: the lane metadata lists each token's lanes in ascending
+    expert order (as sonic's CUDA routing-metadata kernel does); the pack then
+    reads the lane rows / scores directly instead of building lane tables.
+
+    The work buffers are kept per shape and shared by every group list (one
+    set per process, not per layer); only ``o`` is freshly allocated.  Two
+    concurrent calls of the same shape would therefore share them, which the
+    ring never does (its calls run in order on one stream).
     """
     if ready_event is not None:
         _current_stream().wait_event(ready_event)
@@ -242,24 +314,34 @@ def grouped_down_proj(
     config = config or default_gemm_config()
     if err is None:
         err = paddle.zeros([1], dtype=paddle.int32)
-    key = (id(groups), T, K, E, H, I)
+    key = (T, K, H, I)
     s = _scratch.get(key)
     if s is None:
-        s = _scratch[key] = _Scratch(T, K, I, H, groups)
+        s = _scratch[key] = _Scratch(T, K, I, H)
+    buckets = _buckets(groups, s, T, K, I, H)
     varlen = token_lane_offset is not None
     off = token_lane_offset if varlen else lane_rows
-    _lane_tables_kernel[(triton.cdiv(T, _BT),)](
-        lane_rows, lane_scores, off, expert_frequency_offset, ids, s.row_s, s.w_s, err, T, E,
-        K=K, KP=s.KP, LOGE=int(E + 1).bit_length(), VARLEN=varlen, CHECK=True,
-        BT=_BT, num_warps=4,
-    )
-    w2t = w2.permute(0, 2, 1)
-    for c, nseg, at, bidx, nmax, a, y2v in s.buckets:  # rows of a GEMM are < nmax
-        cu = plan.cu_slice(at, nseg)
-        _pack_kernel[(triton.cdiv(nmax, _BR),)](
-            y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR,
-            IP=triton.next_power_of_2(I), num_warps=4,
+    if not lanes_sorted:
+        _lane_tables_kernel[(triton.cdiv(T, _BT),)](
+            lane_rows, lane_scores, off, expert_frequency_offset, ids, s.row_s, s.w_s, err, T, E,
+            K=K, KP=s.KP, LOGE=int(E + 1).bit_length(), VARLEN=varlen, CHECK=True,
+            BT=_BT, num_warps=4,
         )
+    w2t = w2.permute(0, 2, 1)
+    for c, nseg, at, bidx, nmax, a, y2v in buckets:  # rows of a GEMM are < nmax
+        cu = plan.cu_slice(at, nseg)
+        if lanes_sorted:
+            _pack_direct_kernel[(triton.cdiv(nmax, _BR_DIRECT),)](
+                y1, plan.row_tok, plan.row_code, lane_rows, lane_scores, off, expert_frequency_offset,
+                bidx if bidx is not None else cu, cu, a, err, nseg, K=K, I=I, C=c, BR=_BR_DIRECT,
+                IP=triton.next_power_of_2(I), VARLEN=varlen, CHECK=_CHECK_DIRECT,
+                LOGS=max(1, int(nseg).bit_length()), num_warps=4,
+            )
+        else:
+            _pack_kernel[(triton.cdiv(nmax, _BR),)](
+                y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR,
+                IP=triton.next_power_of_2(I), num_warps=4,
+            )
         gemm(a, w2t, out=y2v, cu_seqlens_m=cu, B_idx=bidx, tuned=False, config=config)
     o = paddle.empty([T, H], dtype=paddle.bfloat16)
     token_gather_and_sum_varlen_K_triton(s.y2, None, o, plan.perm, plan.moff, T, K, H, True)
@@ -273,6 +355,13 @@ class _GroupedPlan:
     ids: paddle.Tensor
     err: paddle.Tensor
     ready_event: object = None
+    # The caller keeps the plan's buffers unchanged until this forward's
+    # backward has run: the up projection then reuses the plan for its input
+    # gradient (grouped dz @ W1 + combine instead of per-lane GEMM + k-sum).
+    backward: bool = False
+    # Set by the routing-metadata producer: each token's lanes are listed in
+    # ascending expert order (see `grouped_down_proj`'s ``lanes_sorted``).
+    lanes_sorted: bool = False
 
 
 _local = threading.local()
@@ -283,14 +372,17 @@ def current_grouped_plan():
 
 
 @contextlib.contextmanager
-def grouped_down_proj_plan(groups, plan, ids, err=None, ready_event=None):
+def grouped_down_proj_plan(groups, plan, ids, err=None, ready_event=None, backward=False):
     """Install (groups, plan, ids) for the next ``_DownProjection`` forward on
     this thread; None restores the default path.  ``ready_event``: an event the
     down projection waits on (the plan was produced on another stream).
-    Nestable."""
+    ``backward``: the plan also serves the up projection's input gradient in
+    this forward's backward; the caller must keep its buffers unchanged until
+    then.  Nestable."""
     prev = getattr(_local, "cur", None)
     _local.cur = _GroupedPlan(
-        groups, plan, ids, err if err is not None else paddle.zeros([1], dtype=paddle.int32), ready_event
+        groups, plan, ids, err if err is not None else paddle.zeros([1], dtype=paddle.int32), ready_event,
+        bool(backward),
     )
     try:
         yield _local.cur

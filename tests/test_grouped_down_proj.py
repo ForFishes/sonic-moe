@@ -169,10 +169,13 @@ def test_mismatched_routing_sets_error():
     assert int(err.numpy()[0]) == 1
 
 
-def test_moe_forward_backward_matches_default():
+@pytest.mark.parametrize("I", [64, 256])
+@pytest.mark.parametrize("bwd", [False, True])
+def test_moe_forward_backward_matches_default(bwd, I):
     """End to end: output within bf16 error of the default path, and every
     gradient bitwise identical (the backward recomputes y2 and reads neither
-    y2 nor o)."""
+    y2 nor o).  bwd: the plan also serves the input gradient (grouped
+    dz @ W1 + combine); x.grad then within bf16 error, the others bitwise."""
     T, H, I, E, K = 2048, 512, 128, 32, 8
     rng = np.random.RandomState(9)
     ids = _routing(rng, E, K, T, 0.05)
@@ -191,7 +194,7 @@ def test_moe_forward_backward_matches_default():
         sc = paddle.to_tensor(np.where(ids >= 0, rng.dirichlet(np.ones(K), size=T), 0).astype(np.float32))
         for t in (x, w1, w2, sc):
             t.stop_gradient = False
-        ctx = grouped_down_proj_plan(gl, plan, d_ids, err) if grouped else _nullctx()
+        ctx = grouped_down_proj_plan(gl, plan, d_ids, err, backward=bwd) if grouped else _nullctx()
         with ctx:
             o = run_sonic_moe(x, paddle.to_tensor(ids.astype(np.int64)), sc, K, E, w1, w2)
         (o.astype(paddle.float32) * 0.01).sum().backward()
@@ -199,14 +202,33 @@ def test_moe_forward_backward_matches_default():
         g = lambda t: t.astype(paddle.float32).numpy()  # noqa: E731
         return g(o), {n: g(t.grad) for n, t in (("x", x), ("w1", w1), ("w2", w2), ("sc", sc))}
 
+    import importlib
+
+    fn_mod = importlib.import_module("sonicmoe.functional")
+    real, calls = fn_mod.grouped_down_proj, []
+
+    def counted(*a, **k):
+        calls.append(int(a[0].shape[1]))  # per-expert K: I forward, 2I backward
+        return real(*a, **k)
+
     rng = np.random.RandomState(1)
     o0, g0 = run(False)
     rng = np.random.RandomState(1)
-    o1, g1 = run(True)
+    fn_mod.grouped_down_proj = counted
+    try:
+        o1, g1 = run(True)
+    finally:
+        fn_mod.grouped_down_proj = real
+    grouped_dx = bwd and 2 * I <= fn_mod.GROUPED_DX_MAX_K
+    assert calls == ([I, 2 * I] if grouped_dx else [I]), calls
     assert int(err.numpy()[0]) == 0
     rel = np.linalg.norm(o1 - o0) / np.linalg.norm(o0)
     assert np.isfinite(o1).all() and rel < 1e-2, rel
     for n in g0:
+        if grouped_dx and n == "x":  # grouped sum order differs from the per-lane k-sum
+            r = np.linalg.norm(g1[n] - g0[n]) / np.linalg.norm(g0[n])
+            assert np.isfinite(g1[n]).all() and r < 1e-2, r
+            continue
         assert np.array_equal(g0[n], g1[n]), (n, np.abs(g0[n] - g1[n]).max())
 
 
@@ -215,3 +237,68 @@ import contextlib  # noqa: E402
 
 def _nullctx():
     return contextlib.nullcontext()
+
+
+def test_group_lists_share_buffers_and_stay_correct():
+    """Several group lists of one shape (several layers, and lists that are
+    freed and replaced) share one set of work buffers and each stays exact."""
+    import gc
+    import importlib
+
+    gdp = importlib.import_module("sonicmoe.functional.grouped_down_proj")  # the module, not the function
+
+    E, K, T, H, I = 64, 8, 2048, 256, 128
+    rng = np.random.RandomState(11)
+    ids = _routing(rng, E, K, T, 0.05)
+    w = (2.0 ** -rng.randint(0, 2, (T, K))).astype(np.float32)
+    y1 = (rng.randint(-1, 2, (T * K, I)) * (rng.rand(T * K, I) < 0.08)).astype(np.float32)
+    w2 = rng.randint(-1, 2, (E, H, I)).astype(np.float32)
+    lists = [frequent_groups(ids, (2,), n) for n in (50, 300, 120)] + [frequent_groups(ids, (2, 3, 4), 200)]
+    n_before = len(gdp._scratch)
+    for _ in range(2):
+        for groups in lists:  # each call builds (and drops) its own GroupList
+            o_prod, o_g, err, _ = run_both(ids, w, y1, w2, groups)
+            gc.collect()
+            assert err == 0
+            assert np.array_equal(o_g, o_prod)
+    assert len(gdp._scratch) <= n_before + 1  # one buffer set for the shape, not one per list
+
+
+@pytest.mark.parametrize("drop", [0.0, 0.1])
+def test_direct_lanes_from_cuda_metadata(drop):
+    """With lanes from sonic's routing-metadata kernel (each token's lanes in
+    ascending expert order), lanes_sorted=True skips the lane tables and gives
+    the same output bit for bit; a plan from other routing sets the error."""
+    import importlib
+
+    md = importlib.import_module("sonicmoe.ernie_compat.deepep_metadata")
+    if not md.metadata_lanes_expert_sorted():
+        pytest.skip("CUDA routing-metadata kernel not built")
+    E, K, T, H, I = 64, 8, 2048, 256, 48
+    rng = np.random.RandomState(13)
+    ids = _routing(rng, E, K, T, drop).astype(np.int32)
+    tpe = np.bincount(ids[ids >= 0], minlength=E).astype(np.int32)
+    p = rng.rand(T, K).astype(np.float32)
+    efo, _, _, rows, off, sc = md.deepep_topk_to_sonic_metadata(
+        dev(ids, paddle.int32), dev(p, paddle.float32), dev(tpe, paddle.int32), E, block=1
+    )[:6]
+    index = P.build_index(frequent_groups(ids, (2, 3), 200), E)
+    out = P.alloc_out(T, K, index)
+    nrow = P.plan(ids.astype(np.int16), index, P.Scratch(T, K, index, 8), out)
+    plan, gl = Plan.from_host(out, nrow), GroupList(index)
+    y1 = dev(rng.randint(-2, 3, (int(rows.shape[0]), I)).astype(np.float32), paddle.float32).astype(paddle.bfloat16)
+    w2 = dev(rng.randint(-1, 2, (E, H, I)).astype(np.float32), paddle.float32).astype(paddle.bfloat16)
+    d_ids = dev(ids, paddle.int32)
+
+    def run(sorted_, plan_=plan):
+        err = paddle.zeros([1], dtype=paddle.int32)
+        o = grouped_down_proj(y1, w2, efo, rows, sc, off, d_ids, plan_, gl, err, lanes_sorted=sorted_)
+        paddle.device.synchronize()
+        return o.astype(paddle.float32).numpy(), int(err.numpy()[0])
+
+    (a, ea), (b, eb) = run(False), run(True)
+    assert ea == 0 and eb == 0 and np.array_equal(a, b)
+    other = ids[rng.permutation(T)]
+    out2 = P.alloc_out(T, K, index)
+    n2 = P.plan(other.astype(np.int16), index, P.Scratch(T, K, index, 8), out2)
+    assert run(True, Plan.from_host(out2, n2))[1] == 1

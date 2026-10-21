@@ -19,6 +19,7 @@ from .enums import ActivationType
 from .ernie_compat.deepep_metadata import (
     deepep_topk_to_sonic_metadata,
     deepep_topk_to_sonic_metadata_with_scales,
+    metadata_lanes_expert_sorted,
 )
 from .ernie_compat.mlp_node_v2 import (
     _differentiable_router_scores,
@@ -29,6 +30,7 @@ from .functional import (
     _coerce_activation_type,
     attach_preallocated_gated_outputs,
 )
+from .functional.grouped_down_proj import current_grouped_plan
 from .functional.utils import enable_fp8
 
 try:
@@ -230,6 +232,12 @@ def run_sonic_moe(
             block=128 if fp8 else 1,
             sync_free_sizing=sync_free_sizing,
         )
+        # The CUDA metadata kernel lists each token's lanes in ascending expert
+        # order; an installed grouped down-projection plan can then skip its
+        # lane tables.
+        _gp = current_grouped_plan()
+        if _gp is not None:
+            _gp.lanes_sorted = metadata_lanes_expert_sorted()
 
     s_scatter_idx.stop_gradient = True
     # Caller-supplied activation (was hardcoded to "swiglu").  Normalised here so
