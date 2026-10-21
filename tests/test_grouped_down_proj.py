@@ -169,8 +169,9 @@ def test_mismatched_routing_sets_error():
     assert int(err.numpy()[0]) == 1
 
 
+@pytest.mark.parametrize("I", [64, 256])
 @pytest.mark.parametrize("bwd", [False, True])
-def test_moe_forward_backward_matches_default(bwd):
+def test_moe_forward_backward_matches_default(bwd, I):
     """End to end: output within bf16 error of the default path, and every
     gradient bitwise identical (the backward recomputes y2 and reads neither
     y2 nor o).  bwd: the plan also serves the input gradient (grouped
@@ -218,12 +219,13 @@ def test_moe_forward_backward_matches_default(bwd):
         o1, g1 = run(True)
     finally:
         fn_mod.grouped_down_proj = real
-    assert calls == ([I, 2 * I] if bwd else [I]), calls
+    grouped_dx = bwd and 2 * I <= fn_mod.GROUPED_DX_MAX_K
+    assert calls == ([I, 2 * I] if grouped_dx else [I]), calls
     assert int(err.numpy()[0]) == 0
     rel = np.linalg.norm(o1 - o0) / np.linalg.norm(o0)
     assert np.isfinite(o1).all() and rel < 1e-2, rel
     for n in g0:
-        if bwd and n == "x":  # grouped sum order differs from the per-lane k-sum
+        if grouped_dx and n == "x":  # grouped sum order differs from the per-lane k-sum
             r = np.linalg.norm(g1[n] - g0[n]) / np.linalg.norm(g0[n])
             assert np.isfinite(g1[n]).all() and r < 1e-2, r
             continue

@@ -1493,6 +1493,9 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
 
 
 _UNIT_SCORES = {}
+# The grouped input gradient pays off only for a shallow per-expert K (2I):
+# deeper, the per-lane GEMM is no longer write-bound and grouping loses.
+GROUPED_DX_MAX_K = 256
 
 
 def _unit_scores(n):
@@ -1739,6 +1742,7 @@ class _UpProjection(torch.autograd.Function):
             _gp
             if _gp is not None and _gp.backward and use_quack_gemm and not cfg.enabled
             and supports_expert_k(w1.shape[1])
+            and w1.shape[1] <= GROUPED_DX_MAX_K
             else None
         )
 
