@@ -320,29 +320,53 @@ void prefix_sums_kernel(
     int* warp_totals = reinterpret_cast<int*>(smem);  // [warp_num]
     constexpr int warp_num = BLOCK_DIM >> 5;
 
-    // --- B.1: Expert offsets (thread 0, O(E) — typically 8..128) ---
-    if (threadIdx.x == 0) {
-        int padded_cum = 0;
-        expert_offsets[0] = 0;
-        for (int e = 0; e < num_experts; e++) {
-            const int last = scatter_blocks - 1;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // --- B.1: Expert offsets, a block-wide exclusive scan over the E padded
+    //   expert counts (BLOCKED partition: each thread owns a contiguous run of
+    //   experts).  A single-thread loop here costs E dependent global loads.
+    {
+        const int e_chunk = (num_experts + BLOCK_DIM - 1) / BLOCK_DIM;
+        int e_lo = tid * e_chunk;
+        int e_hi = e_lo + e_chunk;
+        if (e_hi > num_experts) e_hi = num_experts;
+        if (e_lo > num_experts) e_lo = num_experts;
+        const int last = scatter_blocks - 1;
+        int e_partial = 0;
+        for (int e = e_lo; e < e_hi; e++) {
             const int idx = e * scatter_blocks + last;
             const int count = block_offset[idx] + block_hist[idx];
-            int padded = (count > 0) ? ((count + alignment - 1) / alignment * alignment) : 0;
-            seg_starts[e] = padded_cum;
             expert_counts[e] = count;
-            padded_cum += padded;
+            e_partial += (count > 0) ? ((count + alignment - 1) / alignment * alignment) : 0;
+        }
+        const int w_excl = warp_exclusive_scan(e_partial);
+        if (lane == 31) warp_totals[warp] = w_excl + e_partial;
+        __syncthreads();
+        if (warp == 0) {
+            int t = (lane < warp_num) ? warp_totals[lane] : 0;
+            int ex = warp_exclusive_scan(t);
+            if (lane < warp_num) warp_totals[lane] = ex;
+        }
+        __syncthreads();
+        int padded_cum = warp_totals[warp] + w_excl;
+        for (int e = e_lo; e < e_hi; e++) {
+            const int count = expert_counts[e];
+            seg_starts[e] = padded_cum;
+            padded_cum += (count > 0) ? ((count + alignment - 1) / alignment * alignment) : 0;
             expert_offsets[e + 1] = padded_cum;
         }
-        naept[0] = 0;
+        if (tid == 0) {
+            expert_offsets[0] = 0;
+            naept[0] = 0;
+        }
+        __syncthreads();  // warp_totals is reused below
     }
 
     // --- B.3 (v2): exclusive prefix scan of block_naept_sum ---
     //   block_naept_sum has scatter_blocks entries (~3625 at user shape).
     //   Use BLOCKED partition so each thread owns a contiguous chunk.
-    const int tid  = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
 
     int chunk_size = (scatter_blocks + BLOCK_DIM - 1) / BLOCK_DIM;
     int chunk_lo = tid * chunk_size;
