@@ -5,7 +5,8 @@ The ring dispatcher sizes the expert op's metadata from a shape bound
 lanes (expert id -1) the bound exceeds the real lane count, which must not
 change any result: output and every gradient, including the router-score
 gradient of the dropped lanes (zero), are compared bitwise against exact
-sizing, and two runs must agree."""
+sizing, and two runs must agree.  An int ``sync_free_sizing`` tightens the
+bound to a caller-known lane count and must give the same results."""
 
 import numpy as np
 import paddle
@@ -67,3 +68,11 @@ def test_sync_free_sizing_matches_exact_sizing(drop):
     if drop:
         # dropped lanes carry no route, so their score gradient is zero
         assert not exact["sc"][ids < 0].any()
+
+
+@pytest.mark.parametrize("slack", [0, 37])
+def test_sync_free_sizing_lane_bound(slack):
+    T, H, I, E, K = 1024, 256, 128, 16, 4
+    ids = _routing(np.random.RandomState(2), T, K, E, 0.6)
+    bound = int((ids >= 0).sum()) + slack
+    _assert_same(_run(ids, False, T, H, I, E, K), _run(ids, bound, T, H, I, E, K))
